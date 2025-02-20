@@ -8,44 +8,62 @@ import fitz  # PyMuPDF
 
 # Qdrant
 from qdrant_client import QdrantClient, models
+from qdrant_client.conversions.common_types import Record
 
 # ColPali from Hugging Face Transformers
-from transformers import (
-    ColPaliForRetrieval,
-    ColPaliProcessor as HFColPaliProcessor
-)
+from transformers import ColPaliForRetrieval, ColPaliProcessor as HFColPaliProcessor
 
 # Qwen2.5-VL
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
+
 # ------------------------
-#    CONFIG & INIT
+#   CONFIG & CONSTANTS
 # ------------------------
 st.set_page_config(
     page_title="Multimodal RAG: Qwen2.5-VL + ColPali + Qdrant",
     layout="wide"
 )
 
-QDRANT_URL = "http://localhost:6333"
+QDRANT_URL = "http://localhost:6333"  # Change if needed
 COLLECTION_NAME = "qwen-colpali-multimodalRAG"
-EMBEDDING_SIZE = 128  # Adjust if your model has a different embedding dimension
+EMBEDDING_SIZE = 128  # Adjust if your model has different dimension
 
-# 1) Qdrant client
+# ------------------------
+#    QDRANT INIT
+# ------------------------
 @st.cache_resource
 def init_qdrant():
-    client = QdrantClient(url=QDRANT_URL)
-    # Create collection if not exists
-    if not client.collection_exists(COLLECTION_NAME):
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=EMBEDDING_SIZE,
-                distance=models.Distance.COSINE
-            )
-        )
-    return client
+    """
+    Attempt to connect to Qdrant. If unreachable, raise an exception with a
+    helpful message.
+    """
+    try:
+        client = QdrantClient(url=QDRANT_URL)
+        # Simple test call: list collections
+        all_collections = client.get_collections()
+        st.info(f"Successfully connected to Qdrant at {QDRANT_URL}. Found collections: "
+                f"{[c.name for c in all_collections.collections]}")
 
-# 2) ColPali via HF
+        # Create collection if not exists
+        if not client.collection_exists(COLLECTION_NAME):
+            client.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=models.VectorParams(
+                    size=EMBEDDING_SIZE,
+                    distance=models.Distance.COSINE
+                )
+            )
+        return client
+
+    except Exception as e:
+        st.error(f"Could not connect to Qdrant at {QDRANT_URL}. "
+                 "Check that Qdrant is running and accessible.")
+        raise e
+
+# ------------------------
+#   COLPALI INIT
+# ------------------------
 @st.cache_resource
 def init_colpali_hf():
     model_name = "vidore/colpali-v1.2-hf"  # or your chosen HF model
@@ -57,7 +75,9 @@ def init_colpali_hf():
     retrieval_processor = HFColPaliProcessor.from_pretrained(model_name)
     return retrieval_model, retrieval_processor
 
-# 3) Qwen2.5-VL
+# ------------------------
+#   QWEN2.5-VL INIT
+# ------------------------
 @st.cache_resource
 def init_qwen():
     model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
@@ -74,7 +94,7 @@ def init_qwen():
 #   PDF -> IMAGES
 # ------------------------
 def pdf_to_images(pdf_file):
-    """Convert PDF pages to PIL Images."""
+    """Convert PDF pages to a list of PIL Images."""
     images = []
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_file.read())
@@ -94,14 +114,15 @@ def pdf_to_images(pdf_file):
 #  STORE EMBEDDINGS
 # ------------------------
 def store_image_embeddings(images, retrieval_model, retrieval_processor, client):
-    """Embed each page image with HF ColPali, then store in Qdrant."""
+    """
+    Embed each page image with HF ColPali, then store in Qdrant.
+    """
     for i, pil_img in enumerate(images):
         inputs = retrieval_processor(images=pil_img, return_tensors="pt")
-        # Forward pass
         with torch.no_grad():
             emb = retrieval_model(**inputs).embeddings
-        # Flatten & store
         embedding = emb[0].detach().cpu().numpy().flatten()
+
         point = models.PointStruct(
             id=i,
             vector=embedding,
@@ -113,14 +134,14 @@ def store_image_embeddings(images, retrieval_model, retrieval_processor, client)
 #   RETRIEVE NEAREST
 # ------------------------
 def retrieve_best_match(query_text, retrieval_model, retrieval_processor, client):
-    """Embed query, retrieve nearest image from Qdrant."""
-    # Embed the query
+    """
+    Embed query, retrieve nearest image from Qdrant.
+    """
     inputs = retrieval_processor(text=[query_text], return_tensors="pt")
     with torch.no_grad():
         emb = retrieval_model(**inputs).embeddings
     q_emb = emb[0].detach().cpu().numpy().flatten()
 
-    # Search in Qdrant
     result = client.search(
         collection_name=COLLECTION_NAME,
         query_vector=q_emb,
@@ -134,7 +155,9 @@ def retrieve_best_match(query_text, retrieval_model, retrieval_processor, client
 #   QWEN GENERATION
 # ------------------------
 def generate_answer(query, matched_payload, qwen_model, qwen_processor, images):
-    """Use Qwen2.5-VL to answer question given the matched page image."""
+    """
+    Use Qwen2.5-VL to answer question given the matched page image.
+    """
     if matched_payload is None:
         return "No match found in Qdrant."
 
@@ -167,13 +190,18 @@ def generate_answer(query, matched_payload, qwen_model, qwen_processor, images):
     return response
 
 # ------------------------
-#       MAIN APP
+#        MAIN APP
 # ------------------------
 def main():
     st.title("Multimodal RAG: Qwen2.5-VL + ColPali + Qdrant")
     st.write("Upload a PDF, embed with ColPali, store in Qdrant, and query with Qwen2.5-VL.")
 
-    client = init_qdrant()
+    # Initialize Qdrant
+    try:
+        client = init_qdrant()
+    except Exception:
+        st.stop()  # Stop the app if Qdrant connection fails
+
     retrieval_model, retrieval_processor = init_colpali_hf()
     qwen_model, qwen_processor = init_qwen()
 
