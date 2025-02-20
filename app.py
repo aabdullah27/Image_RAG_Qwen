@@ -153,7 +153,7 @@ if st.session_state.ready_to_chat:
             
             # Retrieve relevant content
             search_result = st.session_state.client.search()
-                collection_name=st.session_state.collection_name,
-                query_vector=query_embedding.detach().cpu().numpy().
+            collection_name=st.session_state.collection_name,
+            query_vector=query_embedding.detach().cpu().numpy().
 ::contentReference[oaicite:0]{index=0}
  
