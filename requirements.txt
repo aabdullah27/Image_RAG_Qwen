@@ -1,0 +1,5 @@
+transformers
+qdrant-client
+torch
+streamlit
+colpali-engine
