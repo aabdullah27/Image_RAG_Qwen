@@ -3,39 +3,38 @@ import torch
 import os
 import tempfile
 import io
-
 from PIL import Image
 import fitz  # PyMuPDF
 
 # Qdrant
 from qdrant_client import QdrantClient, models
 
-# ColPali
-from colpali_engine.models import ColPali, ColPaliProcessor
-from transformers import ColPaliForRetrieval, ColPaliProcessor as ColPaliHFProcessor
+# ColPali from Hugging Face Transformers
+from transformers import (
+    ColPaliForRetrieval,
+    ColPaliProcessor as HFColPaliProcessor
+)
 
 # Qwen2.5-VL
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-
 # ------------------------
-#     CONFIG & INIT
+#    CONFIG & INIT
 # ------------------------
 st.set_page_config(
-    page_title="Multimodal RAG powered by Qwen2.5-VL + ColPali + Qdrant",
+    page_title="Multimodal RAG: Qwen2.5-VL + ColPali + Qdrant",
     layout="wide"
 )
 
-# Qdrant constants
 QDRANT_URL = "http://localhost:6333"
 COLLECTION_NAME = "qwen-colpali-multimodalRAG"
-EMBEDDING_SIZE = 128  # Adjust if your model produces different dims
+EMBEDDING_SIZE = 128  # Adjust if your model has a different embedding dimension
 
 # 1) Qdrant client
 @st.cache_resource
 def init_qdrant():
     client = QdrantClient(url=QDRANT_URL)
-    # Create collection if it doesn't exist
+    # Create collection if not exists
     if not client.collection_exists(COLLECTION_NAME):
         client.create_collection(
             collection_name=COLLECTION_NAME,
@@ -46,23 +45,17 @@ def init_qdrant():
         )
     return client
 
-# 2) ColPali for retrieval
+# 2) ColPali via HF
 @st.cache_resource
-def init_colpali():
-    # Option A: Use the HF interface for retrieval:
-    # model_name = "vidore/colpali-v1.2-hf"
-    # retrieval_model = ColPaliForRetrieval.from_pretrained(
-    #     model_name,
-    #     torch_dtype=torch.bfloat16,
-    #     device_map="auto"
-    # ).eval()
-    # retrieval_processor = ColPaliHFProcessor.from_pretrained(model_name)
-
-    # Option B: Use the official colpali_engine library:
-    model_name = "vidore/colpali-v1.2"
-    embed_model = ColPali.from_pretrained(model_name)
-    embed_processor = ColPaliProcessor.from_pretrained(model_name)
-    return embed_model, embed_processor
+def init_colpali_hf():
+    model_name = "vidore/colpali-v1.2-hf"  # or your chosen HF model
+    retrieval_model = ColPaliForRetrieval.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    ).eval()
+    retrieval_processor = HFColPaliProcessor.from_pretrained(model_name)
+    return retrieval_model, retrieval_processor
 
 # 3) Qwen2.5-VL
 @st.cache_resource
@@ -78,10 +71,10 @@ def init_qwen():
     return qwen_model, qwen_processor
 
 # ------------------------
-#   PDF -> IMAGES UTILS
+#   PDF -> IMAGES
 # ------------------------
 def pdf_to_images(pdf_file):
-    """Convert PDF pages to a list of PIL images."""
+    """Convert PDF pages to PIL Images."""
     images = []
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_file.read())
@@ -100,74 +93,68 @@ def pdf_to_images(pdf_file):
 # ------------------------
 #  STORE EMBEDDINGS
 # ------------------------
-def store_image_embeddings(images, embed_model, embed_processor, client):
-    """Embed each page image with ColPali, then store in Qdrant."""
+def store_image_embeddings(images, retrieval_model, retrieval_processor, client):
+    """Embed each page image with HF ColPali, then store in Qdrant."""
     for i, pil_img in enumerate(images):
-        # Get embedding
-        processed = embed_processor(images=pil_img, return_tensors="pt")
-        # For the official colpali_engine approach:
-        embedding = embed_model.get_image_features(**processed).detach().cpu().numpy().flatten()
-        # Upsert into Qdrant
+        inputs = retrieval_processor(images=pil_img, return_tensors="pt")
+        # Forward pass
+        with torch.no_grad():
+            emb = retrieval_model(**inputs).embeddings
+        # Flatten & store
+        embedding = emb[0].detach().cpu().numpy().flatten()
         point = models.PointStruct(
             id=i,
             vector=embedding,
-            payload={"page_index": i}  # store any metadata you want
+            payload={"page_index": i}
         )
         client.upsert(collection_name=COLLECTION_NAME, points=[point])
 
 # ------------------------
 #   RETRIEVE NEAREST
 # ------------------------
-def retrieve_best_match(query_text, embed_model, embed_processor, client):
-    """Embed query, retrieve nearest image embedding from Qdrant, return the best payload."""
-    # Get query embedding
-    processed_q = embed_processor(text=query_text, return_tensors="pt")
-    q_emb = embed_model.get_text_features(**processed_q).detach().cpu().numpy().flatten()
+def retrieve_best_match(query_text, retrieval_model, retrieval_processor, client):
+    """Embed query, retrieve nearest image from Qdrant."""
+    # Embed the query
+    inputs = retrieval_processor(text=[query_text], return_tensors="pt")
+    with torch.no_grad():
+        emb = retrieval_model(**inputs).embeddings
+    q_emb = emb[0].detach().cpu().numpy().flatten()
+
     # Search in Qdrant
-    search_result = client.search(
+    result = client.search(
         collection_name=COLLECTION_NAME,
         query_vector=q_emb,
-        limit=1  # top-1
+        limit=1
     )
-    if not search_result:
+    if not result:
         return None
-    # Return the top match
-    return search_result[0]
+    return result[0]  # top match
 
 # ------------------------
 #   QWEN GENERATION
 # ------------------------
 def generate_answer(query, matched_payload, qwen_model, qwen_processor, images):
-    """
-    matched_payload should have 'id' or 'page_index' so we can fetch the image from images list.
-    We'll feed the text query + that page image into Qwen2.5-VL.
-    """
+    """Use Qwen2.5-VL to answer question given the matched page image."""
     if matched_payload is None:
-        return "No matching page found in Qdrant."
+        return "No match found in Qdrant."
+
     page_index = matched_payload.id
     if page_index < 0 or page_index >= len(images):
         return "Could not locate the matched page image."
 
     matched_image = images[page_index]
 
-    # Qwen expects a list of messages with "role" and "content" array
-    # Each content piece can be a dict with {"type":"text"/"image", ...}
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": query},
-                {"type": "image", "image": matched_image}  # pass PIL image
+                {"type": "image", "image": matched_image}
             ]
         }
     ]
-    # Prepare input
-    inputs = qwen_processor(
-        messages,
-        return_tensors="pt"
-    ).to(qwen_model.device)
+    inputs = qwen_processor(messages, return_tensors="pt").to(qwen_model.device)
 
-    # Generate
     with torch.no_grad():
         output_ids = qwen_model.generate(
             **inputs,
@@ -180,42 +167,34 @@ def generate_answer(query, matched_payload, qwen_model, qwen_processor, images):
     return response
 
 # ------------------------
-#    MAIN APP
+#       MAIN APP
 # ------------------------
 def main():
-    st.title("Multimodal RAG powered by Qwen2.5-VL + ColPali + Qdrant")
-    st.write("Upload a PDF, then ask questions about it.")
+    st.title("Multimodal RAG: Qwen2.5-VL + ColPali + Qdrant")
+    st.write("Upload a PDF, embed with ColPali, store in Qdrant, and query with Qwen2.5-VL.")
 
-    # Initialize everything
     client = init_qdrant()
-    embed_model, embed_processor = init_colpali()
+    retrieval_model, retrieval_processor = init_colpali_hf()
     qwen_model, qwen_processor = init_qwen()
 
-    # PDF upload
     pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
     if pdf_file:
         if st.button("Index PDF"):
-            with st.spinner("Converting PDF to images & embedding..."):
-                # Convert PDF pages to images
+            with st.spinner("Indexing PDF..."):
                 images = pdf_to_images(pdf_file)
-                # Store embeddings
-                store_image_embeddings(images, embed_model, embed_processor, client)
-            st.success("PDF indexed successfully. You can now query it.")
-
-            # Keep the images in session state for retrieval
+                store_image_embeddings(images, retrieval_model, retrieval_processor, client)
             st.session_state["pdf_images"] = images
+            st.success("PDF indexed! Ask questions below.")
 
-    # Query
     if "pdf_images" in st.session_state:
         query_text = st.text_input("Ask a question about your PDF:")
         if query_text:
-            matched = retrieve_best_match(query_text, embed_model, embed_processor, client)
-            answer = generate_answer(query_text, matched, qwen_model, qwen_processor, st.session_state["pdf_images"])
-            st.markdown(f"**Answer:** {answer}")
+            match = retrieve_best_match(query_text, retrieval_model, retrieval_processor, client)
+            answer = generate_answer(query_text, match, qwen_model, qwen_processor, st.session_state["pdf_images"])
+            st.write("**Answer:**", answer)
 
     st.markdown("---")
-    st.markdown("**Note:** This demo requires Qdrant running locally and the dev version of Transformers for Qwen2.5-VL.")
-
+    st.markdown("Powered by Qwen2.5-VL, ColPali, Qdrant, and Streamlit")
 
 if __name__ == "__main__":
     main()
