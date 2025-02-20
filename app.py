@@ -1,12 +1,11 @@
 import streamlit as st
 import torch
-from transformers import AutoModelForCausalLM, AutoProcessor
-from qdrant_client import QdrantClient, models
-import fitz  # PyMuPDF for PDF processing
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
+from PIL import Image
+import fitz  # PyMuPDF
 import io
 import tempfile
 import os
-from PIL import Image
 
 # Page config
 st.set_page_config(
@@ -18,8 +17,6 @@ st.set_page_config(
 # Initialize session state
 if 'ready_to_chat' not in st.session_state:
     st.session_state.ready_to_chat = False
-if 'collection_name' not in st.session_state:
-    st.session_state.collection_name = "multimodal-rag"
 if 'processed_pages' not in st.session_state:
     st.session_state.processed_pages = []
 
@@ -48,21 +45,29 @@ def process_pdf_to_images(pdf_file):
     os.unlink(tmp_file.name)
     return images
 
-# Initialize QDrant client
-@st.cache_resource
-def init_qdrant():
-    return QdrantClient(url="http://localhost:6333")
-
 # Initialize model and processor
 @st.cache_resource
 def init_model():
+    model_name = "Qwen/Qwen-VL-Chat"  # Using Qwen-VL-Chat instead of Qwen2.5-VL
+    
     model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen2.5-VL-3B-Instruct",
+        model_name,
         torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="auto",
+        trust_remote_code=True  # Important for Qwen models
     )
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
-    return model, processor
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True
+    )
+    
+    processor = AutoProcessor.from_pretrained(
+        model_name,
+        trust_remote_code=True
+    )
+    
+    return model, tokenizer, processor
 
 # Sidebar for document upload
 with st.sidebar:
@@ -80,27 +85,15 @@ with st.sidebar:
             st.rerun()
 
 # Main chat interface
-st.title("Multimodal RAG powered by Qwen2.5-VL")
+st.title("Multimodal RAG powered by Qwen-VL")
 
 if uploaded_file and not st.session_state.ready_to_chat:
-    with st.spinner("Indexing your document..."):
+    with st.spinner("Processing your document..."):
         try:
             # Process document
             images = process_pdf_to_images(uploaded_file)
             st.session_state.processed_pages = images
             st.session_state.ready_to_chat = True
-            
-            # Initialize QDrant collection
-            client = init_qdrant()
-            if not client.collection_exists(st.session_state.collection_name):
-                client.create_collection(
-                    collection_name=st.session_state.collection_name,
-                    vectors_config=models.VectorParams(
-                        size=1024,  # Adjust based on your embedding size
-                        distance=models.Distance.COSINE
-                    )
-                )
-            
             st.success("Ready to Chat!")
             
         except Exception as e:
@@ -111,14 +104,14 @@ if st.session_state.ready_to_chat:
     # Display PDF preview
     st.sidebar.subheader("PDF Preview")
     if st.session_state.processed_pages:
-        st.sidebar.image(st.session_state.processed_pages[0], use_column_width=True)
+        st.sidebar.image(st.session_state.processed_pages[0], use_container_width=True)
     
     # Chat interface
-    query = st.text_input("What's up?")
+    query = st.text_input("Ask a question about your document:")
     
     if query:
         try:
-            model, processor = init_model()
+            model, tokenizer, processor = init_model()
             
             # Prepare the conversation
             messages = [
@@ -131,28 +124,34 @@ if st.session_state.ready_to_chat:
                 }
             ]
             
-            # Generate response
-            inputs = processor.apply_chat_template(messages, tokenize=True, return_tensors="pt")
-            inputs = inputs.to(model.device)
+            # Process input
+            inputs = processor(
+                messages,
+                return_tensors="pt",
+                padding=True,
+                truncation=True
+            ).to(model.device)
             
+            # Generate response
             with torch.no_grad():
                 output_ids = model.generate(
-                    inputs,
+                    **inputs,
                     max_new_tokens=512,
                     do_sample=True,
                     temperature=0.7,
                     top_p=0.8
                 )
             
-            response = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            response = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             st.write(response)
             
         except Exception as e:
             st.error(f"Error generating response: {str(e)}")
+            st.error("Full error:", exc_info=True)
 
 else:
     st.info("Please upload a document to start chatting!")
 
 # Add footer
 st.markdown("---")
-st.markdown("Powered by Qwen2.5-VL and Streamlit")
+st.markdown("Powered by Qwen-VL and Streamlit")
