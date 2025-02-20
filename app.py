@@ -152,7 +152,7 @@ if st.session_state.ready_to_chat:
             query_embedding = embed_model.get_text_features(**processed_query)
             
             # Retrieve relevant content
-            search_result = st.session_state.client.search(
+            search_result = st.session_state.client.search()
                 collection_name=st.session_state.collection_name,
                 query_vector=query_embedding.detach().cpu().numpy().
 ::contentReference[oaicite:0]{index=0}
